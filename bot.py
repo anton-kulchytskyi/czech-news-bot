@@ -1,20 +1,28 @@
 """Czech News Digest Bot.
 
-Крок 2 — RSS: при старті бот тягне заголовки з RSS-джерел і шле сирий
-список у Telegram. Поки одне джерело (Novinky.cz), щоб перевірити, що мережа
-і feedparser працюють на Railway. Далі розширимо список і додамо дайджест.
+Крок 3 — дайджест через Claude: при старті бот тягне заголовки з RSS, генерує
+стислий україномовний дайджест через Anthropic API і шле його в Telegram
+(з розбиттям на частини під ліміт 4096). Розклад додамо на кроці 4.
 Після відправки процес лишається живим (idle-sleep), щоб Railway не крутив crash-loop.
 """
 
 import os
 import sys
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import feedparser
 import httpx
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
+MAX_TOKENS = 1500
+TIMEZONE = ZoneInfo("Europe/Prague")
+TELEGRAM_LIMIT = 4096
 
 # iDnes і Hospodářské noviny (servis.idnes.cz) поки віддають порожньо навіть з браузерним
 # User-Agent — тимчасово прибрані. За потреби повернемо й розберемось окремо.
@@ -25,8 +33,15 @@ RSS_FEEDS = [
     {"name": "E15", "url": "https://www.e15.cz/rss"},
 ]
 
-# Скільки заголовків брати з кожного джерела (на кроці 2 менше, бо ще без розбиття на 4096).
-ITEMS_PER_FEED = 5
+# Скільки заголовків брати з кожного джерела (Claude сам обере 7–10 найважливіших).
+ITEMS_PER_FEED = 8
+
+# Деякі чеські сайти блокують дефолтний User-Agent feedparser, тому качаємо фід
+# через httpx з браузерним UA, а потім парсимо байти.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 
 def send_telegram(text: str) -> None:
@@ -43,12 +58,26 @@ def send_telegram(text: str) -> None:
     resp.raise_for_status()
 
 
-# Деякі чеські сайти (servis.idnes.cz) блокують дефолтний User-Agent feedparser
-# і віддають порожньо, тому качаємо фід через httpx з браузерним UA, а потім парсимо байти.
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
+def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
+    """Розбиває довге повідомлення на частини під ліміт Telegram, по рядках."""
+    parts: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        # Окремий рядок довший за ліміт — ріжемо його жорстко.
+        while len(line) > limit:
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) + 1 > limit:
+            parts.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        parts.append(current)
+    return parts
 
 
 def fetch_news() -> list[dict]:
@@ -75,26 +104,67 @@ def fetch_news() -> list[dict]:
     return news
 
 
-def format_raw(news: list[dict]) -> str:
-    """Форматує сирий список заголовків для крока 2 (без Claude)."""
-    if not news:
-        return "⚠️ Жодного заголовка не вдалося отримати."
-    lines = ["📰 RSS-перевірка — сирі заголовки:\n"]
-    for item in news:
-        lines.append(f"• [{item['source']}] {item['title']}")
-    return "\n".join(lines)
+def generate_digest(news: list[dict]) -> str:
+    """Генерує україномовний дайджест із чеських заголовків через Anthropic API."""
+    now = datetime.now(TIMEZONE)
+    date_str = now.strftime("%d.%m.%Y, %H:%M")
+    headlines = "\n".join(f"- [{item['source']}] {item['title']}" for item in news)
+
+    prompt = (
+        "Ти — досвідчений редактор новин. Нижче наведено заголовки з чеських "
+        "новинних сайтів (чеською мовою). Зроби стислий дайджест ЖИВОЮ "
+        "УКРАЇНСЬКОЮ мовою за такою структурою:\n\n"
+        f"🇨🇿 Дайджест чеських новин\n🗓 {date_str} (Прага)\n\n"
+        "🗞 Головне\n🏛 Політика\n💰 Економіка\n\n"
+        "Правила:\n"
+        "- усього 7–10 новин, розподілених за темами де це доречно;\n"
+        "- кожна новина — 1–2 речення українською, передавай суть, а не дослівний переклад;\n"
+        "- якщо для якоїсь теми немає новин — пропусти цю секцію;\n"
+        "- без вступів, пояснень і коментарів — лише сам дайджест.\n\n"
+        f"Заголовки:\n{headlines}"
+    )
+
+    resp = httpx.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": CLAUDE_MODEL,
+            "max_tokens": MAX_TOKENS,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        print(f"Anthropic API {resp.status_code}: {resp.text}", flush=True)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["content"][0]["text"].strip()
 
 
 def main() -> None:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERROR: TELEGRAM_TOKEN і TELEGRAM_CHAT_ID мають бути виставлені.", flush=True)
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not ANTHROPIC_API_KEY:
+        print(
+            "ERROR: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID і ANTHROPIC_API_KEY мають бути виставлені.",
+            flush=True,
+        )
         sys.exit(1)
 
     print("Тягну новини з RSS...", flush=True)
     news = fetch_news()
-    print(f"Усього заголовків: {len(news)}. Надсилаю в Telegram...", flush=True)
-    send_telegram(format_raw(news))
-    print("Надіслано. Процес лишається активним.", flush=True)
+    if not news:
+        send_telegram("⚠️ Жодного заголовка не вдалося отримати.")
+        print("Новин немає, дайджест не генерую. Процес лишається активним.", flush=True)
+    else:
+        print(f"Усього заголовків: {len(news)}. Генерую дайджест через Claude...", flush=True)
+        digest = generate_digest(news)
+        print("Дайджест готовий. Надсилаю в Telegram...", flush=True)
+        for part in split_message(digest):
+            send_telegram(part)
+        print("Надіслано. Процес лишається активним.", flush=True)
 
     # Тримаємо процес живим, щоб Railway бачив воркер як 'running' і не перезапускав.
     while True:
