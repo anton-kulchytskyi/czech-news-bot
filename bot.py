@@ -2,18 +2,22 @@
 
 Збирає заголовки з чеських RSS-джерел, генерує стислий україномовний дайджест
 через Anthropic API і шле його в Telegram (з розбиттям під ліміт 4096).
-Розклад: двічі на день о 07:30 і 20:00 за київським часом (APScheduler).
+Розклад: двічі на день о 07:30 і 20:00 за київським часом (APScheduler, фоновий).
+Основний потік слухає Telegram (long-polling) і реагує на постійну кнопку
+«📰 Дайджест зараз», щоб надіслати свіжий дайджест на вимогу.
 SEND_ON_START=true шле дайджест одразу при запуску (для тесту).
 """
 
 import os
 import sys
+import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import feedparser
 import httpx
-from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -24,6 +28,10 @@ CLAUDE_MODEL = "claude-sonnet-4-20250514"
 MAX_TOKENS = 1500
 TIMEZONE = ZoneInfo("Europe/Kyiv")
 TELEGRAM_LIMIT = 4096
+
+# Текст постійної кнопки внизу екрана. Натискання приходить як звичайне повідомлення
+# з цим текстом — на нього (і на /digest, /start) бот віддає свіжий дайджест.
+BUTTON_TEXT = "📰 Дайджест зараз"
 
 # iDnes і Hospodářské noviny (servis.idnes.cz) поки віддають порожньо навіть з браузерним
 # User-Agent — тимчасово прибрані. За потреби повернемо й розберемось окремо.
@@ -45,12 +53,29 @@ USER_AGENT = (
 )
 
 
-def send_telegram(text: str) -> None:
-    """Надсилає повідомлення в Telegram через Bot API (простий httpx POST)."""
+def persistent_keyboard() -> dict:
+    """Reply-клавіатура з однією кнопкою, що завжди тримається на екрані."""
+    return {
+        "keyboard": [[{"text": BUTTON_TEXT}]],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def send_telegram(text: str, chat_id: str | int | None = None) -> None:
+    """Надсилає повідомлення в Telegram через Bot API (простий httpx POST).
+
+    До кожного повідомлення чіпляємо постійну клавіатуру, щоб кнопка
+    «📰 Дайджест зараз» завжди була на екрані.
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     resp = httpx.post(
         url,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+        json={
+            "chat_id": chat_id if chat_id is not None else TELEGRAM_CHAT_ID,
+            "text": text,
+            "reply_markup": persistent_keyboard(),
+        },
         timeout=30,
     )
     if resp.status_code != 200:
@@ -148,20 +173,82 @@ def generate_digest(news: list[dict]) -> str:
     return data["content"][0]["text"].strip()
 
 
+# Не даємо двом дайджестам генеруватися одночасно (розклад + кнопка / швидкі натискання).
+_digest_lock = threading.Lock()
+
+
 def send_digest() -> None:
     """Повний цикл: RSS -> дайджест через Claude -> відправка в Telegram частинами."""
-    print("Тягну новини з RSS...", flush=True)
-    news = fetch_news()
-    if not news:
-        send_telegram("⚠️ Жодного заголовка не вдалося отримати.")
-        print("Новин немає, дайджест не генерую.", flush=True)
+    if not _digest_lock.acquire(blocking=False):
+        print("Дайджест уже готується — пропускаю повторний виклик.", flush=True)
         return
-    print(f"Усього заголовків: {len(news)}. Генерую дайджест через Claude...", flush=True)
-    digest = generate_digest(news)
-    print("Дайджест готовий. Надсилаю в Telegram...", flush=True)
-    for part in split_message(digest):
-        send_telegram(part)
-    print("Надіслано.", flush=True)
+    try:
+        print("Тягну новини з RSS...", flush=True)
+        news = fetch_news()
+        if not news:
+            send_telegram("⚠️ Жодного заголовка не вдалося отримати.")
+            print("Новин немає, дайджест не генерую.", flush=True)
+            return
+        print(f"Усього заголовків: {len(news)}. Генерую дайджест через Claude...", flush=True)
+        digest = generate_digest(news)
+        print("Дайджест готовий. Надсилаю в Telegram...", flush=True)
+        for part in split_message(digest):
+            send_telegram(part)
+        print("Надіслано.", flush=True)
+    finally:
+        _digest_lock.release()
+
+
+def get_updates(offset: int | None, timeout: int) -> list[dict]:
+    """Тягне оновлення з Telegram (long-polling при timeout>0)."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params: dict = {"timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
+    resp = httpx.get(url, params=params, timeout=timeout + 10)
+    resp.raise_for_status()
+    return resp.json().get("result", [])
+
+
+def handle_update(update: dict) -> None:
+    """Обробляє одне оновлення: кнопка / команди. Реагуємо лише на налаштований чат."""
+    msg = update.get("message")
+    if not msg:
+        return
+    chat_id = msg.get("chat", {}).get("id")
+    if str(chat_id) != str(TELEGRAM_CHAT_ID):
+        # Чужі чати ігноруємо, щоб ніхто сторонній не палив токени.
+        return
+    text = (msg.get("text") or "").strip()
+    if text in ("/start", "/help"):
+        send_telegram(
+            "Привіт! Я шлю дайджест чеських новин українською о 07:30 і 20:00.\n"
+            "Натисни кнопку нижче, щоб отримати свіжий дайджест будь-коли."
+        )
+    elif text == BUTTON_TEXT or text == "/digest":
+        print("Запит дайджесту з кнопки.", flush=True)
+        send_digest()
+
+
+def poll_loop() -> None:
+    """Основний цикл: слухає Telegram і реагує на кнопку/команди."""
+    # Пропускаємо накопичені оновлення, щоб після рестарту не реагувати на старі натискання.
+    try:
+        pending = get_updates(None, timeout=0)
+        offset = pending[-1]["update_id"] + 1 if pending else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"Не вдалося пропустити старі оновлення: {exc}", flush=True)
+        offset = None
+
+    print("Слухаю Telegram (кнопка «📰 Дайджест зараз»)...", flush=True)
+    while True:
+        try:
+            for update in get_updates(offset, timeout=30):
+                offset = update["update_id"] + 1
+                handle_update(update)
+        except Exception as exc:  # noqa: BLE001 — мережеві збої не мають валити процес
+            print(f"poll помилка: {exc}", flush=True)
+            time.sleep(3)
 
 
 def main() -> None:
@@ -176,11 +263,14 @@ def main() -> None:
         print("SEND_ON_START=true — надсилаю дайджест одразу.", flush=True)
         send_digest()
 
-    scheduler = BlockingScheduler(timezone=TIMEZONE)
+    scheduler = BackgroundScheduler(timezone=TIMEZONE)
     scheduler.add_job(send_digest, "cron", hour=7, minute=30, id="morning")
     scheduler.add_job(send_digest, "cron", hour=20, minute=0, id="evening")
-    print("Планувальник запущено: дайджест о 07:30 і 20:00 (Київ).", flush=True)
     scheduler.start()
+    print("Планувальник запущено: дайджест о 07:30 і 20:00 (Київ).", flush=True)
+
+    # Основний потік слухає Telegram (і тримає процес живим).
+    poll_loop()
 
 
 if __name__ == "__main__":
