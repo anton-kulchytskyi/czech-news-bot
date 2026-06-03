@@ -43,12 +43,27 @@ def send_telegram(text: str) -> None:
     resp.raise_for_status()
 
 
+# Деякі чеські сайти (servis.idnes.cz) блокують дефолтний User-Agent feedparser
+# і віддають порожньо, тому качаємо фід через httpx з браузерним UA, а потім парсимо байти.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+
 def fetch_news() -> list[dict]:
     """Тягне заголовки з усіх RSS-джерел. Битий/недоступний фід пропускаємо."""
     news = []
     for feed in RSS_FEEDS:
         try:
-            parsed = feedparser.parse(feed["url"])
+            resp = httpx.get(
+                feed["url"],
+                headers={"User-Agent": USER_AGENT},
+                timeout=30,
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            parsed = feedparser.parse(resp.content)
             entries = parsed.entries[:ITEMS_PER_FEED]
             print(f"{feed['name']}: {len(entries)} заголовків", flush=True)
             for entry in entries:
