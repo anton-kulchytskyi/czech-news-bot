@@ -1,7 +1,8 @@
 """Czech News Digest Bot.
 
-Крок 1 — ping-бот: при старті шле одне повідомлення в Telegram, щоб перевірити,
-що пайплайн repo -> Railway -> Python -> env -> Telegram працює.
+Крок 2 — RSS: при старті бот тягне заголовки з RSS-джерел і шле сирий
+список у Telegram. Поки одне джерело (Novinky.cz), щоб перевірити, що мережа
+і feedparser працюють на Railway. Далі розширимо список і додамо дайджест.
 Після відправки процес лишається живим (idle-sleep), щоб Railway не крутив crash-loop.
 """
 
@@ -9,10 +10,19 @@ import os
 import sys
 import time
 
+import feedparser
 import httpx
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Поки одне джерело — перевіряємо мережу/feedparser. Потім додамо решту з CLAUDE.md.
+RSS_FEEDS = [
+    {"name": "Novinky.cz", "url": "https://www.novinky.cz/rss"},
+]
+
+# Скільки заголовків брати з кожного джерела.
+ITEMS_PER_FEED = 10
 
 
 def send_telegram(text: str) -> None:
@@ -29,14 +39,43 @@ def send_telegram(text: str) -> None:
     resp.raise_for_status()
 
 
+def fetch_news() -> list[dict]:
+    """Тягне заголовки з усіх RSS-джерел. Битий/недоступний фід пропускаємо."""
+    news = []
+    for feed in RSS_FEEDS:
+        try:
+            parsed = feedparser.parse(feed["url"])
+            entries = parsed.entries[:ITEMS_PER_FEED]
+            print(f"{feed['name']}: {len(entries)} заголовків", flush=True)
+            for entry in entries:
+                title = entry.get("title", "").strip()
+                if title:
+                    news.append({"source": feed["name"], "title": title})
+        except Exception as exc:  # noqa: BLE001 — фід може тимчасово не відповідати
+            print(f"Пропускаю {feed['name']}: {exc}", flush=True)
+    return news
+
+
+def format_raw(news: list[dict]) -> str:
+    """Форматує сирий список заголовків для крока 2 (без Claude)."""
+    if not news:
+        return "⚠️ Жодного заголовка не вдалося отримати."
+    lines = ["📰 RSS-перевірка — сирі заголовки:\n"]
+    for item in news:
+        lines.append(f"• [{item['source']}] {item['title']}")
+    return "\n".join(lines)
+
+
 def main() -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("ERROR: TELEGRAM_TOKEN і TELEGRAM_CHAT_ID мають бути виставлені.", flush=True)
         sys.exit(1)
 
-    print("Надсилаю ping у Telegram...", flush=True)
-    send_telegram("✅ Czech News Bot живий")
-    print("Ping надіслано. Процес лишається активним.", flush=True)
+    print("Тягну новини з RSS...", flush=True)
+    news = fetch_news()
+    print(f"Усього заголовків: {len(news)}. Надсилаю в Telegram...", flush=True)
+    send_telegram(format_raw(news))
+    print("Надіслано. Процес лишається активним.", flush=True)
 
     # Тримаємо процес живим, щоб Railway бачив воркер як 'running' і не перезапускав.
     while True:
