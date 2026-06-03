@@ -23,6 +23,9 @@ def send_telegram(text: str) -> None:
         json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
         timeout=30,
     )
+    if resp.status_code != 200:
+        # Показуємо точну причину від Telegram (напр. "Bad Request: chat not found").
+        print(f"Telegram API {resp.status_code}: {resp.text}", flush=True)
     resp.raise_for_status()
 
 
