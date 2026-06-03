@@ -16,13 +16,17 @@ import httpx
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Поки одне джерело — перевіряємо мережу/feedparser. Потім додамо решту з CLAUDE.md.
 RSS_FEEDS = [
+    {"name": "ČT24", "url": "https://ct24.ceskatelevize.cz/rss/hlavni-zpravy"},
+    {"name": "iDnes", "url": "https://servis.idnes.cz/rss.aspx?c=zpravodajstvi"},
     {"name": "Novinky.cz", "url": "https://www.novinky.cz/rss"},
+    {"name": "Seznam Zprávy", "url": "https://www.seznamzpravy.cz/rss"},
+    {"name": "E15", "url": "https://www.e15.cz/rss"},
+    {"name": "Hospodářské noviny", "url": "https://servis.idnes.cz/rss.aspx?c=hn"},
 ]
 
-# Скільки заголовків брати з кожного джерела.
-ITEMS_PER_FEED = 10
+# Скільки заголовків брати з кожного джерела (на кроці 2 менше, бо ще без розбиття на 4096).
+ITEMS_PER_FEED = 5
 
 
 def send_telegram(text: str) -> None:
