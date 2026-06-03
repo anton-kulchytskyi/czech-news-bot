@@ -1,27 +1,28 @@
 """Czech News Digest Bot.
 
-Крок 3 — дайджест через Claude: при старті бот тягне заголовки з RSS, генерує
-стислий україномовний дайджест через Anthropic API і шле його в Telegram
-(з розбиттям на частини під ліміт 4096). Розклад додамо на кроці 4.
-Після відправки процес лишається живим (idle-sleep), щоб Railway не крутив crash-loop.
+Збирає заголовки з чеських RSS-джерел, генерує стислий україномовний дайджест
+через Anthropic API і шле його в Telegram (з розбиттям під ліміт 4096).
+Розклад: двічі на день о 07:30 і 20:00 за київським часом (APScheduler).
+SEND_ON_START=true шле дайджест одразу при запуску (для тесту).
 """
 
 import os
 import sys
-import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import feedparser
 import httpx
+from apscheduler.schedulers.blocking import BlockingScheduler
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+SEND_ON_START = os.environ.get("SEND_ON_START", "").lower() == "true"
 
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 MAX_TOKENS = 1500
-TIMEZONE = ZoneInfo("Europe/Prague")
+TIMEZONE = ZoneInfo("Europe/Kyiv")
 TELEGRAM_LIMIT = 4096
 
 # iDnes і Hospodářské noviny (servis.idnes.cz) поки віддають порожньо навіть з браузерним
@@ -114,7 +115,7 @@ def generate_digest(news: list[dict]) -> str:
         "Ти — досвідчений редактор новин. Нижче наведено заголовки з чеських "
         "новинних сайтів (чеською мовою). Зроби стислий дайджест ЖИВОЮ "
         "УКРАЇНСЬКОЮ мовою за такою структурою:\n\n"
-        f"🇨🇿 Дайджест чеських новин\n🗓 {date_str} (Прага)\n\n"
+        f"🇨🇿 Дайджест чеських новин\n🗓 {date_str} (Київ)\n\n"
         "🗞 Головне\n🏛 Політика\n💰 Економіка\n\n"
         "Правила:\n"
         "- усього 7–10 новин, розподілених за темами де це доречно;\n"
@@ -147,6 +148,22 @@ def generate_digest(news: list[dict]) -> str:
     return data["content"][0]["text"].strip()
 
 
+def send_digest() -> None:
+    """Повний цикл: RSS -> дайджест через Claude -> відправка в Telegram частинами."""
+    print("Тягну новини з RSS...", flush=True)
+    news = fetch_news()
+    if not news:
+        send_telegram("⚠️ Жодного заголовка не вдалося отримати.")
+        print("Новин немає, дайджест не генерую.", flush=True)
+        return
+    print(f"Усього заголовків: {len(news)}. Генерую дайджест через Claude...", flush=True)
+    digest = generate_digest(news)
+    print("Дайджест готовий. Надсилаю в Telegram...", flush=True)
+    for part in split_message(digest):
+        send_telegram(part)
+    print("Надіслано.", flush=True)
+
+
 def main() -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not ANTHROPIC_API_KEY:
         print(
@@ -155,22 +172,15 @@ def main() -> None:
         )
         sys.exit(1)
 
-    print("Тягну новини з RSS...", flush=True)
-    news = fetch_news()
-    if not news:
-        send_telegram("⚠️ Жодного заголовка не вдалося отримати.")
-        print("Новин немає, дайджест не генерую. Процес лишається активним.", flush=True)
-    else:
-        print(f"Усього заголовків: {len(news)}. Генерую дайджест через Claude...", flush=True)
-        digest = generate_digest(news)
-        print("Дайджест готовий. Надсилаю в Telegram...", flush=True)
-        for part in split_message(digest):
-            send_telegram(part)
-        print("Надіслано. Процес лишається активним.", flush=True)
+    if SEND_ON_START:
+        print("SEND_ON_START=true — надсилаю дайджест одразу.", flush=True)
+        send_digest()
 
-    # Тримаємо процес живим, щоб Railway бачив воркер як 'running' і не перезапускав.
-    while True:
-        time.sleep(3600)
+    scheduler = BlockingScheduler(timezone=TIMEZONE)
+    scheduler.add_job(send_digest, "cron", hour=7, minute=30, id="morning")
+    scheduler.add_job(send_digest, "cron", hour=20, minute=0, id="evening")
+    print("Планувальник запущено: дайджест о 07:30 і 20:00 (Київ).", flush=True)
+    scheduler.start()
 
 
 if __name__ == "__main__":

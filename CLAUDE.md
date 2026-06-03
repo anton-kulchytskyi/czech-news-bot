@@ -6,19 +6,22 @@ Telegram-бот, який двічі на день збирає новини з 
 ## Стек
 - Python 3.12
 - `feedparser` — парсинг RSS
-- `httpx` — запити до Anthropic API
-- `python-telegram-bot` — відправка в Telegram
-- `APScheduler` — розклад (08:00 і 18:00, таймзона Europe/Prague)
+- `httpx` — запити до Anthropic API і до Telegram Bot API (відправка простим POST, без python-telegram-bot)
+- `APScheduler` — розклад (07:30 і 20:00, таймзона Europe/Kyiv)
+- Деплой: Railway (фоновий worker, без HTTP-порту)
 
 ## Джерела новин (RSS)
+Фіди качаються через httpx з браузерним User-Agent (деякі сайти блокують дефолтний UA feedparser).
+
 | Сайт | URL |
 |---|---|
 | ČT24 | https://ct24.ceskatelevize.cz/rss/hlavni-zpravy |
-| iDnes | https://servis.idnes.cz/rss.aspx?c=zpravodajstvi |
 | Novinky.cz | https://www.novinky.cz/rss |
 | Seznam Zprávy | https://www.seznamzpravy.cz/rss |
 | E15 (економіка) | https://www.e15.cz/rss |
-| Hospodářské noviny | https://servis.idnes.cz/rss.aspx?c=hn |
+
+> iDnes (`...?c=zpravodajstvi`) і Hospodářské noviny (`...?c=hn`) з servis.idnes.cz тимчасово
+> вимкнені — віддають порожньо навіть з браузерним User-Agent. Повернути після окремого розбору.
 
 ## Теми дайджесту
 Загальні новини, Політика, Економіка
@@ -45,11 +48,10 @@ pip install -r requirements.txt
 
 # Запустити бота
 python bot.py
-
-# Або через Docker
-docker compose up -d
-docker compose logs -f
 ```
+
+Деплой на Railway: репо підключене до сервісу, `Procfile` (`worker: python bot.py`) тримає
+фоновий процес. Змінні середовища — у Railway → Variables. Пуш у `main` тригерить авто-деплой.
 
 ## Типові задачі
 
@@ -60,8 +62,8 @@ docker compose logs -f
 ```
 
 ### Змінити час відправки
-У `bot.py` в функції `main()` знайди рядок з `scheduler.add_job` — там параметр `hour`.
-Час вказується за Europe/Prague (не UTC).
+У `bot.py` в функції `main()` знайди рядки з `scheduler.add_job` — там параметри `hour`/`minute`.
+Час вказується за Europe/Kyiv (не UTC). Зараз два джоби: 07:30 (`morning`) і 20:00 (`evening`).
 
 ### Змінити стиль або теми дайджесту
 У `bot.py` знайди функцію `generate_digest()` — там є промпт для Claude. Редагуй текст промпту.
@@ -70,10 +72,8 @@ docker compose logs -f
 Додай бота як адміністратора. `TELEGRAM_CHAT_ID` для каналу має вигляд `-100xxxxxxxxxx`.
 
 ### Протестувати без чекання розкладу
-```bash
-SEND_ON_START=true python bot.py
-# Ctrl+C одразу після отримання дайджесту
-```
+Вистав `SEND_ON_START=true` (локально або у Railway → Variables) — бот надішле дайджест
+одразу при запуску, а потім стане на розклад. Прибери змінну, щоб шати лише за розкладом.
 
 ## Відомі нюанси
 - Деякі чеські RSS можуть тимчасово не відповідати — це нормально, бот пропускає і йде далі
